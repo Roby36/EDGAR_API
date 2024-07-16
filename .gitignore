@@ -2,5 +2,6 @@ Ignore/
 
 *.txt
 *.pdf
+*.xlsx
 .DS_Store
 
