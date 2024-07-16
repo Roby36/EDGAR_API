@@ -1,1 +1,6 @@
 Ignore/
+
+*.txt
+*.pdf
+.DS_Store
+
