@@ -6,10 +6,10 @@ Lightweight Python-based tool designed to efficiently scrape and download filing
 
 ## Main end points used:
 - **`https://www.sec.gov/files/company_tickers.json`**: Provides the list in .json format of all companies currently listed on SEC.
--**`https://data.sec.gov/submissions/CIK{cik}.json`**: Provides the metadata for the company with CIK number given by `{cik}`, including recent filing accession numbers and other information.
--**`https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json`**: Provides company facts dataset for the company with CIK number given by `{cik}` as presented on all financial statements ever published on SEC by the company.
--**`https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}{concept}.json`**: Provides more insights on a particular company concept or financial metric.
--**`https://www.sec.gov/Archives/edgar/data/{cik}/{accession_number_stripped}/{filename}`**: Provides direct access to the htm-formatted version of an archived filing with dash-free accession number `{accession_number_stripped}` and document name `{filename}` for company with CIK number `{cik}`.
+- **`https://data.sec.gov/submissions/CIK{cik}.json`**: Provides the metadata for the company with CIK number given by `{cik}`, including recent filing accession numbers and other information.
+- **`https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json`**: Provides company facts dataset for the company with CIK number given by `{cik}` as presented on all financial statements ever published on SEC by the company.
+- **`https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}{concept}.json`**: Provides more insights on a particular company concept or financial metric.
+- **`https://www.sec.gov/Archives/edgar/data/{cik}/{accession_number_stripped}/{filename}`**: Provides direct access to the htm-formatted version of an archived filing with dash-free accession number `{accession_number_stripped}` and document name `{filename}` for company with CIK number `{cik}`.
 
 ## Main Features
 - **Request Throttling**: Implements controlled request timings to comply with the SEC's rate limits, ensuring the scraper runs efficiently without violating usage terms. Response codes are handled and logged to the user. 
