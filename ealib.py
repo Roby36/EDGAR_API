@@ -12,14 +12,10 @@ from collections import Counter
 import random
 import yfinance as yf
 
-"""
-Timing global constants / variables:
-"""
+""" Timing global constants / variables """
 last_req = 0
 
-""" 
-API url getters
-"""
+""" API url getters """
 def tickers_url() -> str:
     return "https://www.sec.gov/files/company_tickers.json"
 
@@ -39,9 +35,7 @@ def companyconcept_url(cik, concept) -> str:
 def doc_url(cik, accession_number_stripped, filename) -> str:
     return f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_number_stripped}/{filename}"
 
-""" 
-UTILS / WRAPPERS
-"""
+""" UTILS / WRAPPERS """
 def requests_get_wrp(url, headers, mrps) -> requests.Response:
     global last_req     # allows function to write to variable outside its scope
     interval = 1/mrps
@@ -80,10 +74,17 @@ def yf_info(ticker_str, query_info):
         return None
     return ticker_info [query_info]
 
+def ciq_ticker(comp_mtd, ticker) -> str:
+    """ 
+    Attempts to retrieve {exchange}:{ticker} from company metadata
+    Returns {ticker} as failsafe
+    """
+    exch = comp_mtd["exchanges"]
+    tck  = comp_mtd["tickers"]
+    if not exch or not tck:
+        return ticker["ticker"]
+    return f"{exch[0]}:{tck[0]}"
 
-"""
-COMPANY TICKERS dataframe getter
-"""
 def get_tickers_df(headers) -> pd.DataFrame:
     resp_dict = get_response_dict(tickers_url(), headers, 1)
     tickers_df = pd.DataFrame.from_dict(resp_dict, orient="index")
@@ -91,9 +92,7 @@ def get_tickers_df(headers) -> pd.DataFrame:
     tickers_df["cik_str"] = tickers_df["cik_str"].astype(str).str.zfill(10)
     return tickers_df
 
-""" 
-Compunded measures 
-"""
+""" Compunded measures/indicators """
 def ocf_average_daily_burn_rate(ocf_df, start_col = "start", end_col = "end", ocf_val_col = "val"):
     # Start by converting start, end columns to datetime
     ocf_df[start_col] = pd.to_datetime(ocf_df[start_col])
@@ -103,15 +102,39 @@ def ocf_average_daily_burn_rate(ocf_df, start_col = "start", end_col = "end", oc
     return (ocf_df[ocf_val_col] / (ocf_df[end_col] - ocf_df[start_col]).dt.days).mean()
 
 
-"""
-Search functions
-"""
+"""Search functions """
 def find_ticker(df, query_ticker) -> pd.DataFrame:
     return df[df["ticker"] == query_ticker]
 
 def find_title_substring(df, query_title_substring) -> pd.DataFrame:
     return df[df["title"].str.contains(query_title_substring, case=False, na=False)]
 
+def find_dict_key_substr(dict, query_substrs) -> List[str]:
+    res = []
+    for key in dict.keys():
+        for qs in query_substrs:
+            if qs.lower() in key.lower():
+                res.append(key)
+    return res
+
+def find_keys_containing_all_substrs(dict, query_substrs) -> str: 
+    """
+    Extension of function above.
+    Intended to identify metric by checking for all substrings containment
+    """
+    res = []
+    for key in dict.keys():
+        not_found = False
+        for qs in query_substrs:
+            if qs.lower() not in key.lower():
+                not_found = True
+                break
+        if not not_found:
+            res.append(key)
+    return res
+
+
+""" Filtering functions """
 def filter_filings(filings_df, filing_date_col, form_col, query_forms, max_days) -> pd.DataFrame:
     """
     Function responsible for filtering filings that are then scraped.
@@ -142,48 +165,8 @@ def filter_filings(filings_df, filing_date_col, form_col, query_forms, max_days)
 
     return filings_df[cum_mask]
 
-def find_dict_key_substr(dict, query_substrs) -> List[str]:
-    res = []
-    for key in dict.keys():
-        for qs in query_substrs:
-            if qs.lower() in key.lower():
-                res.append(key)
-    return res
 
-# More sophisticated dictionary key search 
-def find_keys_containing_all_substrs(dict, query_substrs) -> str: 
-    """
-    Extension of function above.
-    Intended to identify metric by checking for all substrings containment
-    """
-    res = []
-    for key in dict.keys():
-        not_found = False
-        for qs in query_substrs:
-            if qs.lower() not in key.lower():
-                not_found = True
-                break
-        if not not_found:
-            res.append(key)
-    return res
-
-def ciq_ticker(comp_mtd, ticker) -> str:
-    """ 
-    Attempts to retrieve {exchange}:{ticker} from company metadata
-    Returns {ticker} as failsafe
-    """
-    exch = comp_mtd["exchanges"]
-    tck  = comp_mtd["tickers"]
-    if not exch or not tck:
-        return ticker["ticker"]
-    return f"{exch[0]}:{tck[0]}"
-
-
-
-"""
-Main document scraping functions 
-"""
-
+""" Main document scraping functions """
 def download_company_filings(req_header, mrps, comp_dir, select_filings, cik, write_txt, write_pdf):
     """ 
     Downloads selcted documents for a company, organizing subdirectories.
@@ -294,6 +277,7 @@ def company_fact_df(curr_ticker, as_keys, query_fact_substr, sufficient, req_hea
     return (units, min_cf_key, pd.DataFrame(nested_cf_dict["units"][units]))
 
 
+""" Main function in the module """
 def screen_select_companies(
     # general parameters:
         req_header, mrps, tickers_df, root_dir, 
@@ -303,6 +287,7 @@ def screen_select_companies(
         write_txt, write_pdf
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """ 
+    Applies hard-coded filters on companies dataframe.
     Downloads selcted documents for dataset of companies, organizing subdirectories
     
     req_header: identification header required by SEC for get requests
@@ -340,7 +325,7 @@ def screen_select_companies(
         curr_comp_series["Company name"] = comp_name
         logging.info(f"Starting screening procedure for {comp_name}, at index {index}")
         
-        """ (1) FILING FILTER """
+        """ (1) FILING FILTER (SEC reqs) """
         curr_comp_mtd = get_response_dict(metadata_url(curr_ticker["cik_str"] ), req_header, mrps=mrps)
         if curr_comp_mtd is None or not curr_comp_mtd.get("filings") or not curr_comp_mtd.get("filings", {}).get("recent"):
             logging.warning(f'Could not find comp_mtd["filings"]["recent"] dictionary for {curr_ticker["ticker"]}, skipping company')
@@ -374,7 +359,7 @@ def screen_select_companies(
             )
         """
 
-        """ (2) OCF burn FILTER """
+        """ (2) OCF burn FILTER (SEC reqs) """
         ocf_res = company_fact_df(
             curr_ticker=curr_ticker, 
             as_keys=["us-gaap", "ifrs-full"], 
@@ -417,7 +402,7 @@ def screen_select_companies(
         # Note: companies WITHOUT OCF information SPARED
 
 
-        """ (3) MARKET CAP FILTER """
+        """ (3) MARKET CAP FILTER (yf) """
         curr_comp_series["Market Cap"]          = yf_info(curr_ticker["ticker"], "marketCap")
         curr_comp_series["Market Cap Currency"] = yf_info(curr_ticker["ticker"], "currency")
         if curr_comp_series["Market Cap Currency"] is None or curr_comp_series["Market Cap"] is None:
@@ -443,7 +428,7 @@ def screen_select_companies(
         # Note: companies WITH missing market cap data SPARED
 
 
-        """ Other METRICS / Properties """
+        """ Other deriving METRICS / Properties """
         curr_comp_series["CIQ ticker"] = ciq_ticker(curr_comp_mtd, curr_ticker)
         if "USD Market Cap" in curr_comp_series and curr_comp_series["USD Market Cap"] is not None and "USD Avg daily OCF burn" in curr_comp_series:
                     curr_comp_series["Avg yearly OCF burn / Market Cap"] = 360 * curr_comp_series["USD Avg daily OCF burn"] / curr_comp_series["USD Market Cap"]
@@ -454,9 +439,7 @@ def screen_select_companies(
         else:
             comp_out_df     = pd.concat([comp_out_df,     pd.DataFrame([curr_comp_series])], ignore_index=False)
 
-        """ 
-        FINAL: Saving company selected fiings after ALL filtering has been done
-        """
+        """ FINAL: Saving company selected fiings after ALL filtering has been done """
         comp_dir = os.path.join(root_dir, comp_name)
         download_company_filings(req_header, mrps, comp_dir, curr_select_filings, curr_ticker["cik_str"] , write_txt=write_txt, write_pdf=write_pdf)
         logging.info(f"Downloaded filings for {comp_name} at index {index}")
@@ -481,6 +464,4 @@ def screen_select_companies(
         logging.warning(f"'{out_df_sort_key}' not found in DataFrame. Sorting not performed.")
     
     return (comp_out_df, missing_data_df)
-
-
 
