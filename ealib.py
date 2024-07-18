@@ -10,41 +10,12 @@ import os
 import pdfkit
 from collections import Counter
 import random
+import yfinance as yf
 
 """
 Timing global constants / variables:
 """
 last_req = 0
-
-""" 
-UTILS
-"""
-def requests_get_wrp(url, headers, mrps) -> requests.Response:
-    global last_req     # allows function to write to variable outside its scope
-    interval = 1/mrps
-    curr_time = time.time()
-    elapsed_since_last = curr_time - last_req 
-    # Wait if the interval since last request is too short
-    if elapsed_since_last < interval:
-        time.sleep(interval - elapsed_since_last)
-        logging.info(f"Exceeded maximum requests per second. Sleeping for {interval - elapsed_since_last} seconds...")
-    response = requests.get(url, headers=headers)
-    # Update the last request timestamp
-    last_req = time.time()
-
-    # Handle response
-    resp_code = response.status_code 
-    if resp_code < 200 or resp_code >= 300:
-        logging.warning(f"Request to {url} was unsuccessful. Response code: {resp_code}")
-        return None
-    logging.info(f"Request to {url} returned successfully. Response code: {resp_code}")
-    return response
-
-def get_response_dict(url, headers, mrps) -> dict:
-    response = requests_get_wrp(url, headers, mrps)
-    if response == None:
-        return None
-    return response.json()
 
 """ 
 API url getters
@@ -67,6 +38,48 @@ def companyconcept_url(cik, concept) -> str:
 
 def doc_url(cik, accession_number_stripped, filename) -> str:
     return f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_number_stripped}/{filename}"
+
+""" 
+UTILS / WRAPPERS
+"""
+def requests_get_wrp(url, headers, mrps) -> requests.Response:
+    global last_req     # allows function to write to variable outside its scope
+    interval = 1/mrps
+    curr_time = time.time()
+    elapsed_since_last = curr_time - last_req 
+    # Wait if the interval since last request is too short
+    if elapsed_since_last < interval:
+        logging.info(f"Exceeded maximum requests per second. Sleeping for {interval - elapsed_since_last} seconds...")
+        time.sleep(interval - elapsed_since_last)
+    response = requests.get(url, headers=headers)
+    # Update the last request timestamp
+    last_req = time.time()
+
+    # Handle response
+    resp_code = response.status_code 
+    if resp_code < 200 or resp_code >= 300:
+        logging.warning(f"Request to {url} was unsuccessful. Response code: {resp_code}")
+        return None
+    logging.info(f"Request to {url} returned successfully. Response code: {resp_code}")
+    return response
+
+def get_response_dict(url, headers, mrps) -> dict:
+    response = requests_get_wrp(url, headers, mrps)
+    if response == None:
+        return None
+    return response.json()
+
+def yf_info(ticker_str, query_info):
+    """
+    Wrapper function to handle keys-not-found errors,
+    and usable with lambda to .apply() to whole series.
+    Returns None if info not found
+    """
+    ticker_info = yf.Ticker(ticker_str).info
+    if query_info not in ticker_info:
+        return None
+    return ticker_info [query_info]
+
 
 """
 COMPANY TICKERS dataframe getter
@@ -110,15 +123,17 @@ def filter_filings(filings_df, filing_date_col, form_col, query_forms, max_days)
     return: copy of a filtered dataframe
     """
 
-    # Taking the union of the query document types
+    # First sort filings by date
+    filings_df[filing_date_col] = pd.to_datetime(filings_df[filing_date_col], format='%Y-%m-%d')
+    filings_df = filings_df.sort_values(by=filing_date_col, ascending=False)
+
+    # Then initialize the mask
     cum_mask = pd.Series(False, index=filings_df[form_col].index) # Fill with False values
+
+    # Taking the union of the query document types
     for substr in query_forms:
         curr_mask = filings_df[form_col].str.contains(substr, case=False, na=False)
         cum_mask = cum_mask | curr_mask
-    
-    # Sort by date
-    filings_df[filing_date_col] = pd.to_datetime(filings_df[filing_date_col], format='%Y-%m-%d')
-    filings_df = filings_df.sort_values(by=filing_date_col, ascending=False)
     
     # Excluding less recent documents
     current_date = datetime.now()
@@ -169,35 +184,6 @@ def ciq_ticker(comp_mtd, ticker) -> str:
 Main document scraping functions 
 """
 
-def get_company_entry(ticker, comp_mtd, select_filings) -> pd.Series:
-    """ 
-    Wrapper processing information to store for each company
-    """
-
-    comp_out_series = pd.Series()
-    comp_out_series["title"]  = ticker["title"]
-    comp_out_series["CIQ ticker"] = ciq_ticker(comp_mtd, ticker)
-    curr_doc_counts = select_filings["form"].value_counts()
-    for index, val in curr_doc_counts.items():
-        comp_out_series[f"Number of recent {index} forms"] = val
-
-    # Dataframe containing most recent forms for each form type 
-    # Note: assumes dataframe already sorted by date
-    last_forms_df = select_filings.groupby('form').head(1)
-
-    for index, row in last_forms_df.iterrows():
-        # Access data from 'accessionNumber' and 'primaryDocument'
-        form_name = row["form"]
-        comp_out_series[f"Most recent {form_name} date"] = row["filingDate"]
-        comp_out_series[f"Most recent {form_name} url"] = doc_url(
-                ticker["cik_str"],
-                row["accessionNumber"].replace("-",""),
-                row["primaryDocument"]
-        )
-
-    return comp_out_series
-
-
 def download_company_filings(req_header, mrps, comp_dir, select_filings, cik, write_txt, write_pdf):
     """ 
     Downloads selcted documents for a company, organizing subdirectories.
@@ -245,77 +231,6 @@ def download_company_filings(req_header, mrps, comp_dir, select_filings, cik, wr
                 }
             )
 
-def download_select_filings(req_header, mrps, tickers_df, root_dir, query_forms, max_days, write_txt, write_pdf) -> pd.DataFrame:
-    """ 
-    Downloads selcted documents for dataset of companies, organizing subdirectories
-    
-    req_header: identification header required by SEC for get requests
-    mrps: maximum requests per second to SEC
-    tickers_df: dataframe of tickers of companies to scrape
-    root_dir: root directory under which all company subdirectories and filings to be saved
-    query_forms: list of form types to be considered
-    max_days: maximum days for a filing to be considered recent
-    write_txt: True iff we want to save downloaded documents in plain text (debugging)
-    write_pdf: True iff we want to save downloaded documents in pdf format
-
-    return: dataframe containing companies matching queried parameters, with relevant information
-            also saves dataframe to Excel, with CIQ Tickers to gather further information if required
-    """
-
-    start_time = time.time()
-    os.makedirs(root_dir, exist_ok=True)
-    comp_out_df = pd.DataFrame()
-
-    for index, curr_ticker in tickers_df.iterrows():
-
-        comp_name = curr_ticker["title"]
-        logging.info(f"Starting download filings procedure for {comp_name}")
-
-        """ 
-        Requesting company metadata to filter on filings
-        """
-        curr_comp_mtd = get_response_dict(metadata_url(curr_ticker["cik_str"] ), req_header, mrps=mrps)
-        curr_filings_df = pd.DataFrame.from_dict(curr_comp_mtd["filings"]["recent"])
-
-        # Apply filing filters, and continue if they yield an empty dataframe
-        curr_select_filings = filter_filings(curr_filings_df, "filingDate", "form", query_forms, max_days)
-        if curr_select_filings.empty:
-            logging.info(f"No filings for {comp_name} match the specified criteria. Iterating to next company.")
-            continue
-
-        """ 
-        TODO: other filtering before saving and downloading company
-        """
-
-        """ 
-        Saving company properties to overall dataframe
-        """
-        curr_comp_out_series = get_company_entry(curr_ticker, curr_comp_mtd, curr_select_filings)
-        comp_out_df = pd.concat([comp_out_df, pd.DataFrame([curr_comp_out_series])], ignore_index=False)
-
-        """ 
-        Downloading select filings for the company --> data/computationally intensive
-        """
-        comp_dir = os.path.join(root_dir, comp_name)
-        download_company_filings(req_header, mrps, comp_dir, curr_select_filings, curr_ticker["cik_str"] , write_txt=write_txt, write_pdf=write_pdf)
-        logging.info(f"Terminating download filings procedure for {comp_name}")
-    
-
-    # End of main loop. Timing work:
-    end_time = time.time()
-    duration_seconds = end_time - start_time
-    hours = duration_seconds // 3600
-    minutes = (duration_seconds % 3600) // 60
-    seconds = duration_seconds % 60
-    logging.info(
-        f"Screened a total of {tickers_df.shape[0]} companies in " 
-        f"{int(hours)} hours, {int(minutes)} minutes, {seconds:.2f} seconds"
-    )
-
-    # Save to Excel and output dataframe 
-    comp_out_df.to_excel(f'{root_dir}.xlsx', sheet_name='Sheet1', index=False)
-    return comp_out_df
-
 
 def company_fact_df(curr_ticker, as_keys, query_fact_substr, sufficient, req_header, mrps) -> (str, str, pd.DataFrame):
     """
@@ -345,7 +260,7 @@ def company_fact_df(curr_ticker, as_keys, query_fact_substr, sufficient, req_hea
 
     # Attempt to retrieve comp_facts dictionary from SEC
     comp_facts = get_response_dict(companyfacts_url(curr_ticker["cik_str"]), req_header, mrps)
-    if comp_facts is None or not comp_facts or "facts" not in comp_facts:
+    if comp_facts is None or not comp_facts.get("facts"):
         logging.warning(f'Failed request when attempting to retrieve company facts for ticker {curr_ticker["ticker"]}, or comp_facts dictionary empty')
         return None
     
@@ -372,12 +287,194 @@ def company_fact_df(curr_ticker, as_keys, query_fact_substr, sufficient, req_hea
 
     # Attempt to access inner dictionaries to find historical values
     nested_cf_dict = comp_facts["facts"][res_as_key][min_cf_key]
-    if "units" not in nested_cf_dict or not nested_cf_dict["units"]:
+    if not nested_cf_dict.get("units"):
         logging.warning(f'Cannot find nested dictionary company facts for ticker {curr_ticker["ticker"]}, comp fact key {min_cf_key}')
         return None
     units = next(iter(nested_cf_dict["units"])) # Note: we just retrieve some unit, not checking whether more are available
     return (units, min_cf_key, pd.DataFrame(nested_cf_dict["units"][units]))
 
+
+def screen_select_companies(
+    # general parameters:
+        req_header, mrps, tickers_df, root_dir, 
+    # filtering parameters:
+        query_forms, max_days, max_market_cap, max_ocf_daily_burn_rate, ocf_max_days, ocf_filing_date_col, out_df_sort_key,
+    # download parameters:
+        write_txt, write_pdf
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """ 
+    Downloads selcted documents for dataset of companies, organizing subdirectories
+    
+    req_header: identification header required by SEC for get requests
+    mrps: maximum requests per second to SEC
+    tickers_df: dataframe of tickers of companies to scrape
+    root_dir: root directory under which all company subdirectories and filings to be saved
+
+    query_forms: list of form types to be considered
+    max_days: maximum days for a filing to be considered recent
+    max_ocf_burn_rate: maximum cash burn rate value to consider companies
+    ocf_max_days: maximum days back to consider OCF filing records
+    filing_date_col: how to classify the date of an OCF filing ("end" or "filed")
+
+    write_txt: True iff we want to save downloaded documents in plain text (debugging)
+    write_pdf: True iff we want to save downloaded documents in pdf format
+
+    return: dataframe containing companies matching queried parameters, with relevant information
+            also saves dataframe to Excel, with CIQ Tickers to gather further information if required
+    """
+
+    # Main initializations:
+    start_time = time.time()
+    os.makedirs(root_dir, exist_ok=True)
+    comp_out_df = pd.DataFrame()
+    missing_data_df = pd.DataFrame()
+
+    # Iterating through input tickers set
+    for index, curr_ticker in tickers_df.iterrows():
+
+        # Initializing company local variables
+        curr_comp_series = pd.Series()
+        missing_data = False
+        comp_name = curr_ticker["title"]
+        curr_comp_series["Company name"] = comp_name
+        logging.info(f"Starting screening procedure for {comp_name}, at index {index}")
+        
+        """ (1) FILING FILTER """
+        curr_comp_mtd = get_response_dict(metadata_url(curr_ticker["cik_str"] ), req_header, mrps=mrps)
+        if curr_comp_mtd is None or not curr_comp_mtd.get("filings") or not curr_comp_mtd.get("filings", {}).get("recent"):
+            logging.warning(f'Could not find comp_mtd["filings"]["recent"] dictionary for {curr_ticker["ticker"]}, skipping company')
+            continue
+        curr_filings_df = pd.DataFrame.from_dict(curr_comp_mtd["filings"]["recent"])
+        curr_select_filings = filter_filings(curr_filings_df, "filingDate", "form", query_forms, max_days)
+
+        # Filtering condition (1)
+        if curr_select_filings.empty:
+            logging.info(f"No filings for {comp_name} match the specified criteria. Iterating to next company.")
+            continue
+        # Note: companies with missing filings DISCARDED
+        """
+        Skipping recent form properties for simplicity:
+
+        for index, val in curr_doc_counts.items():
+            comp_out_series[f"Number of recent {index} forms"] = val
+        # Dataframe containing most recent forms for each form type 
+        # Note: assumes dataframe already sorted by date
+        last_forms_df = curr_select_filings.groupby('form').head(1)
+        for index, row in last_forms_df.iterrows():
+            # Access data from 'accessionNumber' and 'primaryDocument'
+            form_name = row["form"]
+            comp_out_series[f"Most recent {form_name} date"] = row["filingDate"]
+            comp_out_series[f"Most recent {form_name} url"] = doc_url(
+                    curr_ticker["cik_str"],
+                    row["accessionNumber"].replace("-",""),
+                    row["primaryDocument"]
+            )
+        """
+
+        """ (2) OCF burn FILTER """
+        ocf_res = company_fact_df(
+            curr_ticker=curr_ticker, 
+            as_keys=["us-gaap", "ifrs-full"], 
+            query_fact_substr=["NetCashProvidedByUsedInOperatingActivities", "CashFlowsFromUsedInOperatingActivities"], 
+            sufficient=True,
+            req_header=req_header, 
+            mrps=mrps
+        )
+        if ocf_res is None:
+            missing_data = True
+            logging.info(f"Could not retrieve OCF data for {comp_name}")
+        else:
+            ocf_units, ocf_selfact, ocf_df = ocf_res
+            curr_comp_series["OCF Currency"] = ocf_units
+            curr_comp_series["OCF Name"] = ocf_selfact # mostly for debugging
+            ocf_df_filt = filter_filings(ocf_df, 
+                filing_date_col=ocf_filing_date_col, form_col="form", query_forms=[""], max_days=ocf_max_days
+            )
+            if not ocf_df_filt.empty:
+                curr_comp_series["Avg daily OCF burn"] = ocf_average_daily_burn_rate(ocf_df_filt)
+
+                # Exhange work
+                ocf_exch_rate = yf_info(
+                    f'{curr_comp_series["OCF Currency"]}USD=X',
+                    "previousClose"
+                )
+                if ocf_exch_rate is None:
+                    logging.warning(f'No exchange rate found for {curr_comp_series["OCF Currency"]}/USD, assuming rate of 1.0')
+                    ocf_exch_rate = 1.0
+                curr_comp_series["USD Avg daily OCF burn"] = curr_comp_series["Avg daily OCF burn"] * ocf_exch_rate
+
+                # Filtering condition (2)
+                if curr_comp_series["USD Avg daily OCF burn"] > max_ocf_daily_burn_rate:
+                    logging.info(f'Excluding {comp_name} with USD Avg daily OCF burn {curr_comp_series["USD Avg daily OCF burn"]}')
+                    continue
+            else:
+                logging.warning(f'No OCF records found for {comp_name} within {ocf_max_days} days')
+                missing_data = True
+        # Note: companies WITHOUT OCF information SPARED
+
+
+        """ (3) MARKET CAP FILTER """
+        curr_comp_series["Market Cap"]          = yf_info(curr_ticker["ticker"], "marketCap")
+        curr_comp_series["Market Cap Currency"] = yf_info(curr_ticker["ticker"], "currency")
+        if curr_comp_series["Market Cap Currency"] is None or curr_comp_series["Market Cap"] is None:
+            missing_data = True
+        # Ensure market cap converted to USD for fair comparison
+        else:
+
+            # Exchange work
+            mk_exch_rate = yf_info(
+                f'{curr_comp_series["Market Cap Currency"]}USD=X',
+                "previousClose"
+            )
+            if mk_exch_rate is None:
+                    logging.warning(f'No exchange rate found for {curr_comp_series["Market Cap Currency"]}/USD, assuming rate of 1.0')
+                    mk_exch_rate = 1.0
+            curr_comp_series["USD Market Cap"] = curr_comp_series["Market Cap"] * mk_exch_rate
+
+            # Filtering condition (3)
+            if curr_comp_series["USD Market Cap"] > max_market_cap:
+                logging.info(f'Excluding company {comp_name} with USD market cap {curr_comp_series["USD Market Cap"]}')
+                continue
+        # Note: companies WITH missing market cap data SPARED
+
+
+        """ Other METRICS / Properties """
+        curr_comp_series["CIQ ticker"] = ciq_ticker(curr_comp_mtd, curr_ticker)
+        if "USD Market Cap" in curr_comp_series and curr_comp_series["USD Market Cap"] is not None and "USD Avg daily OCF burn" in curr_comp_series:
+                    curr_comp_series["Avg yearly OCF burn / Market Cap"] = 360 * curr_comp_series["USD Avg daily OCF burn"] / curr_comp_series["USD Market Cap"]
+
+        """ Adding company series to cumulative dataframes, based on whether all information was received """
+        if missing_data:
+            missing_data_df = pd.concat([missing_data_df, pd.DataFrame([curr_comp_series])], ignore_index=False)
+        else:
+            comp_out_df     = pd.concat([comp_out_df,     pd.DataFrame([curr_comp_series])], ignore_index=False)
+
+        """ 
+        FINAL: Saving company selected fiings after ALL filtering has been done
+        """
+        comp_dir = os.path.join(root_dir, comp_name)
+        download_company_filings(req_header, mrps, comp_dir, curr_select_filings, curr_ticker["cik_str"] , write_txt=write_txt, write_pdf=write_pdf)
+        logging.info(f"Downloaded filings for {comp_name} at index {index}")
+    
+
+    # End of main loop. Timing work:
+    end_time = time.time()
+    duration_seconds = end_time - start_time
+    hours = duration_seconds // 3600
+    minutes = (duration_seconds % 3600) // 60
+    seconds = duration_seconds % 60
+    logging.info(
+        f"Screened a total of {tickers_df.shape[0]} companies in " 
+        f"{int(hours)} hours, {int(minutes)} minutes, {seconds:.2f} seconds"
+    )
+
+    # Sort output dataframe
+    if out_df_sort_key in comp_out_df.columns:
+        comp_out_df = comp_out_df.sort_values(by=out_df_sort_key, ascending=True)
+    else:
+        logging.warning(f"'{out_df_sort_key}' not found in DataFrame. Sorting not performed.")
+    
+    return (comp_out_df, missing_data_df)
 
 
 
