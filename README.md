@@ -33,7 +33,10 @@ The main function of the module, `screen_select_companies`, performs a screening
 - **`ocf_filing_date_col`**: If set to `"filed"`, then the function applies `ocf_max_days` on the filing date of the OCF filings. This yields more data to calculate the average rate on, with the drawback that some filings may effectively cover a more dated period than expected. On the other hand, if set to `"end"`, then the function applies `ocf_max_days` on the effective accounting end date of the OCF filings. This guarantees more recent results, but usually reduces to only one or very few filings. 
 ### Output parameters
 - **`out_df_sort_key`**: The key by which we want to rank the output results. For example, we may enter `"Avg yearly OCF 
-burn / Market Cap"`, which is computed by the function
+burn / Market Cap"`, which is computed by the function.
 - **`write_txt`**: Set to `True` if we want to save the filings as text files (mainly for debugging).
 - **`write_pdf`**: Set to `True` if we want to save the filings in a rendered PDF format (generally preferred option). 
-
+### Return value
+**`Tuple[pd.DataFrame, pd.DataFrame] = (comp_out_df, missing_data_df)`**, where:
+- `comp_out_df` contains the companies passing all the screening filters, with all the data available to verify them
+- `missing_data_df` contains the companies that passed all the screening filters for which data was available, but had some data missing that meant that some filters could not be verified

@@ -328,6 +328,7 @@ def screen_select_companies(
     os.makedirs(root_dir, exist_ok=True)
     comp_out_df = pd.DataFrame()
     missing_data_df = pd.DataFrame()
+    exclusion_reasons = Counter()   # Logging exclusion reasons
 
     # Iterating through input tickers set
     for index, curr_ticker in tickers_df.iterrows():
@@ -343,6 +344,7 @@ def screen_select_companies(
         curr_comp_mtd = get_response_dict(metadata_url(curr_ticker["cik_str"] ), req_header, mrps=mrps)
         if curr_comp_mtd is None or not curr_comp_mtd.get("filings") or not curr_comp_mtd.get("filings", {}).get("recent"):
             logging.warning(f'Could not find comp_mtd["filings"]["recent"] dictionary for {curr_ticker["ticker"]}, skipping company')
+            exclusion_reasons["company filing metadata not found"] += 1
             continue
         curr_filings_df = pd.DataFrame.from_dict(curr_comp_mtd["filings"]["recent"])
         curr_select_filings = filter_filings(curr_filings_df, "filingDate", "form", query_forms, max_days)
@@ -350,6 +352,7 @@ def screen_select_companies(
         # Filtering condition (1)
         if curr_select_filings.empty:
             logging.info(f"No filings for {comp_name} match the specified criteria. Iterating to next company.")
+            exclusion_reasons["no query filing forms found"] += 1
             continue
         # Note: companies with missing filings DISCARDED
         """
@@ -406,6 +409,7 @@ def screen_select_companies(
                 # Filtering condition (2)
                 if curr_comp_series["USD Avg daily OCF burn"] > max_ocf_daily_burn_rate:
                     logging.info(f'Excluding {comp_name} with USD Avg daily OCF burn {curr_comp_series["USD Avg daily OCF burn"]}')
+                    exclusion_reasons["OCF burn rate"] += 1
                     continue
             else:
                 logging.warning(f'No OCF records found for {comp_name} within {ocf_max_days} days')
@@ -434,6 +438,7 @@ def screen_select_companies(
             # Filtering condition (3)
             if curr_comp_series["USD Market Cap"] > max_market_cap:
                 logging.info(f'Excluding company {comp_name} with USD market cap {curr_comp_series["USD Market Cap"]}')
+                exclusion_reasons["Market cap"] += 1
                 continue
         # Note: companies WITH missing market cap data SPARED
 
@@ -467,6 +472,7 @@ def screen_select_companies(
         f"Screened a total of {tickers_df.shape[0]} companies in " 
         f"{int(hours)} hours, {int(minutes)} minutes, {seconds:.2f} seconds"
     )
+    logging.info(f'Exclusion reasons: {exclusion_reasons}')
 
     # Sort output dataframe
     if out_df_sort_key in comp_out_df.columns:
