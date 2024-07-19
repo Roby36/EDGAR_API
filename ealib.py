@@ -11,6 +11,7 @@ import pdfkit
 from collections import Counter
 import random
 import yfinance as yf
+import numpy as np
 
 """ Timing global constants / variables """
 last_req = 0
@@ -74,6 +75,25 @@ def yf_info(ticker_str, query_info):
         return None
     return ticker_info [query_info]
 
+def exch_rate(from_currency, to_currency, default=0) -> float:
+    """
+    Wrapper to convert between two currencies, handling failure from yf
+
+    from_currency:  str for currency we want to convert from   
+    to_currency:    str for target currency     
+    default:        returned value upon failure in retrieving exchange rate from yf
+    return:         exchange rate between from_currency to to_currency                
+    """ 
+
+    exch_rate = yf_info(
+        f'{from_currency}{to_currency}=X',
+        "previousClose"
+    )
+    if exch_rate is None:
+        logging.warning(f'No exchange rate found for {from_currency}/{to_currency}; assuming rate of {default}')
+        exch_rate = default
+    return exch_rate
+
 def ciq_ticker(comp_mtd, ticker) -> str:
     """ 
     Attempts to retrieve {exchange}:{ticker} from company metadata
@@ -135,7 +155,7 @@ def find_keys_containing_all_substrs(dict, query_substrs) -> str:
 
 
 """ Filtering functions """
-def filter_filings(filings_df, filing_date_col, form_col, query_forms, max_days) -> pd.DataFrame:
+def filter_filings(filings_df, filing_date_col, form_col, query_forms, max_days, min_days=0) -> pd.DataFrame:
     """
     Function responsible for filtering filings that are then scraped.
 
@@ -159,9 +179,11 @@ def filter_filings(filings_df, filing_date_col, form_col, query_forms, max_days)
         cum_mask = cum_mask | curr_mask
     
     # Excluding less recent documents
-    current_date = datetime.now()
-    date_mask = filings_df[filing_date_col] >= (current_date - timedelta(days=max_days))
-    cum_mask = cum_mask & date_mask # Combine the existing mask with the new date mask
+    current_date    = datetime.now()
+    max_date_mask   = filings_df[filing_date_col] >= (current_date - timedelta(days=max_days))
+    min_date_mask   = filings_df[filing_date_col] <= (current_date - timedelta(days=min_days))
+    date_mask   = max_date_mask & min_date_mask
+    cum_mask    = cum_mask & date_mask # Combine the existing mask with the new date mask
 
     return filings_df[cum_mask]
 
@@ -214,22 +236,19 @@ def download_company_filings(req_header, mrps, comp_dir, select_filings, cik, wr
                 }
             )
 
-
-def company_fact_df(curr_ticker, as_keys, query_fact_substr, sufficient, req_header, mrps) -> (str, str, pd.DataFrame):
+""" company facts functions """
+def comp_facts_df(comp_facts, query_fact_substr, sufficient) -> List[Tuple[str, str, str, pd.DataFrame]]:
     """
-    Encapsulates the request and retrieval of historical data for any given company fact.
+    Encapsulates the retrieval of historical data for any given company fact, given raw dictionary retrieved from SEC
 
-    curr_ticker: fixed ticker (fucntion expected to be called within iterative loop)
-    company_facts_keys: the keys to be searched within company facts to find desired fact
+    comp_facts: raw company fact dictionary retrieved from SEC: can handle None dictionary
     query_fact_substr: substrings for semantic search of company fact
     sufficient: if True, then one string from query_fact_substr sufficient for key match
                 if False, then all strings from query_fact_substr must be contained
         True is a good option when both gaap and ifrs convention names are known
 
-    req_header, mrps: request settings passed on
-
-    return: None if the company facts request fails, or company fact not found, 
-        o/w (units, comp_fact, pd DataFrame) containing historical data for requested company fact
+    return: [] if desired company fact not located within dictionary
+        o/w List of matching tuples (units, acc_standard, match_fact, comp_fact_df), usually more than one
     
     USAGE EXAMPLES: 
     Either run with
@@ -240,44 +259,45 @@ def company_fact_df(curr_ticker, as_keys, query_fact_substr, sufficient, req_hea
         sufficient = True
     when possible fact names are already known (generally us-gaap or ifrs)
     """
+    # Access iteratively nested dictionaries:
+    matches_tuple_list = []
+    facts_dict = (comp_facts or {}).get("facts", {})
+    for as_key, as_dict in facts_dict.items():
+        match_fact_keys = find_dict_key_substr(as_dict, query_fact_substr) if sufficient else find_keys_containing_all_substrs(as_dict, query_fact_substr)
+        # Here we get a list of the matching key entries found 
+        for match_fact in match_fact_keys:
+            units_dict = as_dict.get(match_fact, {}).get("units", {})
+            if units_dict:
+                units = next(iter(units_dict))
+                comp_fact_df = pd.DataFrame(units_dict.get(units, {}))
+                matches_tuple_list.append((units, as_key, match_fact, comp_fact_df))
+    return matches_tuple_list
 
-    # Attempt to retrieve comp_facts dictionary from SEC
-    comp_facts = get_response_dict(companyfacts_url(curr_ticker["cik_str"]), req_header, mrps)
-    if comp_facts is None or not comp_facts.get("facts"):
-        logging.warning(f'Failed request when attempting to retrieve company facts for ticker {curr_ticker["ticker"]}, or comp_facts dictionary empty')
-        return None
-    
-    # Attempt to find the appropriate accounting standards key for the desired company fact 
-    as_key_found = False
-    cf_key = []
-    res_as_key = ""
-    for key in as_keys:
-        if key in comp_facts["facts"]:
-            as_key_found = True
-            res_as_key = key
-            # Choose comparator to search for company fact key
-            if sufficient:
-                cf_key = find_dict_key_substr(comp_facts["facts"][res_as_key], query_fact_substr)
-            else: 
-                cf_key = find_keys_containing_all_substrs(comp_facts["facts"][res_as_key], query_fact_substr)
-            break
-    if not as_key_found or not cf_key:
-        logging.warning(f'Accounting standards key not found for ticker {curr_ticker["ticker"]}, or query fact not found')
-        return None
-    if len(cf_key) > 1:
-        logging.warning(f'More than one company fact for {curr_ticker["ticker"]} matches search query; returning shortest') 
-    min_cf_key = min(cf_key, key=len)
+def comp_fact_avg_change(matches_tuple_list, min_days, max_days) -> float:
+    """
+    Returns average percentage of the changes of the company fact across datasets provided,
+    between averages (0, min_days), (min_days, max_days) of filings available
+    """
+    deltas = {}
+    for units, as_key, match_fact, fact_df in matches_tuple_list:
+        # Average value between (min_days, max_days)
+        prev_filt_df = filter_filings(fact_df, filing_date_col="end", form_col="form", query_forms=[""], max_days=max_days, min_days=min_days)
+        prev_avg = prev_filt_df["val"].mean()
 
-    # Attempt to access inner dictionaries to find historical values
-    nested_cf_dict = comp_facts["facts"][res_as_key][min_cf_key]
-    if not nested_cf_dict.get("units"):
-        logging.warning(f'Cannot find nested dictionary company facts for ticker {curr_ticker["ticker"]}, comp fact key {min_cf_key}')
-        return None
-    units = next(iter(nested_cf_dict["units"])) # Note: we just retrieve some unit, not checking whether more are available
-    return (units, min_cf_key, pd.DataFrame(nested_cf_dict["units"][units]))
+        # Average value between (0, min_days)
+        curr_filt_df = filter_filings(fact_df, filing_date_col="end", form_col="form", query_forms=[""], max_days=min_days, min_days=0)
+        curr_avg = curr_filt_df["val"].mean()
+
+        # Change in average values
+        avg_change = 100 * (curr_avg - prev_avg) / prev_avg
+        deltas[match_fact] = avg_change
+
+    # Average of the changes across datasets
+    deltas_mean = np.nanmean(np.array(list(deltas.values())))
+    return deltas_mean
 
 
-""" Main function in the module """
+""" Main function in the module, performing some hard-coded filtering """
 def screen_select_companies(
     # general parameters:
         req_header, mrps, tickers_df, root_dir, 
@@ -360,36 +380,31 @@ def screen_select_companies(
         """
 
         """ (2) OCF burn FILTER (SEC reqs) """
-        ocf_res = company_fact_df(
-            curr_ticker=curr_ticker, 
-            as_keys=["us-gaap", "ifrs-full"], 
+        # Attempt to retrieve comp_facts dictionary from SEC
+        comp_facts = get_response_dict(companyfacts_url(curr_ticker["cik_str"]), req_header, mrps)
+        if comp_facts is None:
+            logging.warning(f'Failed request when attempting to retrieve company facts for ticker {curr_ticker["ticker"]}, or comp_facts dictionary empty')
+        ocf_res = comp_facts_df(
+            comp_facts=comp_facts,
             query_fact_substr=["NetCashProvidedByUsedInOperatingActivities", "CashFlowsFromUsedInOperatingActivities"], 
-            sufficient=True,
-            req_header=req_header, 
-            mrps=mrps
+            sufficient=True
         )
-        if ocf_res is None:
+        if not ocf_res:
             missing_data = True
             logging.info(f"Could not retrieve OCF data for {comp_name}")
         else:
-            ocf_units, ocf_selfact, ocf_df = ocf_res
-            curr_comp_series["OCF Currency"] = ocf_units
-            curr_comp_series["OCF Name"] = ocf_selfact # mostly for debugging
+            # NOTE: we select tuple with shortest match_fact (generally the intended company fact)
+            ocf_units, res_as_key, ocf_selfact, ocf_df = min(ocf_res, key=lambda x: len(x[2]))
+            curr_comp_series["OCF Currency"]        = ocf_units
+            curr_comp_series["OCF Name"]            = ocf_selfact # mostly for debugging
+            curr_comp_series["Accounting Standard"] = res_as_key
             ocf_df_filt = filter_filings(ocf_df, 
                 filing_date_col=ocf_filing_date_col, form_col="form", query_forms=[""], max_days=ocf_max_days
             )
             if not ocf_df_filt.empty:
                 curr_comp_series["Avg daily OCF burn"] = ocf_average_daily_burn_rate(ocf_df_filt)
-
                 # Exhange work
-                ocf_exch_rate = yf_info(
-                    f'{curr_comp_series["OCF Currency"]}USD=X',
-                    "previousClose"
-                )
-                if ocf_exch_rate is None:
-                    logging.warning(f'No exchange rate found for {curr_comp_series["OCF Currency"]}/USD, assuming rate of 1.0')
-                    ocf_exch_rate = 1.0
-                curr_comp_series["USD Avg daily OCF burn"] = curr_comp_series["Avg daily OCF burn"] * ocf_exch_rate
+                curr_comp_series["USD Avg daily OCF burn"] = curr_comp_series["Avg daily OCF burn"] * exch_rate(curr_comp_series["OCF Currency"], "USD")
 
                 # Filtering condition (2)
                 if curr_comp_series["USD Avg daily OCF burn"] > max_ocf_daily_burn_rate:
@@ -401,24 +416,15 @@ def screen_select_companies(
                 missing_data = True
         # Note: companies WITHOUT OCF information SPARED
 
-
-        """ (3) MARKET CAP FILTER (yf) """
+        """ (3) MARKET CAP FILTER (yf reqs) """
         curr_comp_series["Market Cap"]          = yf_info(curr_ticker["ticker"], "marketCap")
         curr_comp_series["Market Cap Currency"] = yf_info(curr_ticker["ticker"], "currency")
         if curr_comp_series["Market Cap Currency"] is None or curr_comp_series["Market Cap"] is None:
             missing_data = True
         # Ensure market cap converted to USD for fair comparison
         else:
-
             # Exchange work
-            mk_exch_rate = yf_info(
-                f'{curr_comp_series["Market Cap Currency"]}USD=X',
-                "previousClose"
-            )
-            if mk_exch_rate is None:
-                    logging.warning(f'No exchange rate found for {curr_comp_series["Market Cap Currency"]}/USD, assuming rate of 1.0')
-                    mk_exch_rate = 1.0
-            curr_comp_series["USD Market Cap"] = curr_comp_series["Market Cap"] * mk_exch_rate
+            curr_comp_series["USD Market Cap"] = curr_comp_series["Market Cap"] * exch_rate(curr_comp_series["Market Cap Currency"], "USD")
 
             # Filtering condition (3)
             if curr_comp_series["USD Market Cap"] > max_market_cap:
@@ -464,4 +470,5 @@ def screen_select_companies(
         logging.warning(f"'{out_df_sort_key}' not found in DataFrame. Sorting not performed.")
     
     return (comp_out_df, missing_data_df)
+
 
