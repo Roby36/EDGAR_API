@@ -13,6 +13,8 @@ import random
 import yfinance as yf
 import numpy as np
 
+""" UTILITY FUNCTIONS """
+
 """ Timing global constants / variables """
 last_req = 0
 
@@ -36,7 +38,7 @@ def companyconcept_url(cik, concept) -> str:
 def doc_url(cik, accession_number_stripped, filename) -> str:
     return f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_number_stripped}/{filename}"
 
-""" UTILS / WRAPPERS """
+""" WRAPPERS """
 def requests_get_wrp(url, headers, mrps) -> requests.Response:
     global last_req     # allows function to write to variable outside its scope
     interval = 1/mrps
@@ -70,10 +72,7 @@ def yf_info(ticker_str, query_info):
     and usable with lambda to .apply() to whole series.
     Returns None if info not found
     """
-    ticker_info = yf.Ticker(ticker_str).info
-    if query_info not in ticker_info:
-        return None
-    return ticker_info [query_info]
+    return yf.Ticker(ticker_str).info.get(query_info, None)
 
 def exch_rate(from_currency, to_currency, default=0) -> float:
     """
@@ -121,7 +120,6 @@ def ocf_average_daily_burn_rate(ocf_df, start_col = "start", end_col = "end", oc
     # AVG(oper. cash flow / time period)
     return (ocf_df[ocf_val_col] / (ocf_df[end_col] - ocf_df[start_col]).dt.days).mean()
 
-
 """Search functions """
 def find_ticker(df, query_ticker) -> pd.DataFrame:
     return df[df["ticker"] == query_ticker]
@@ -153,8 +151,6 @@ def find_keys_containing_all_substrs(dict, query_substrs) -> str:
             res.append(key)
     return res
 
-
-""" Filtering functions """
 def filter_filings(filings_df, filing_date_col, form_col, query_forms, max_days, min_days=0) -> pd.DataFrame:
     """
     Function responsible for filtering filings that are then scraped.
@@ -188,8 +184,7 @@ def filter_filings(filings_df, filing_date_col, form_col, query_forms, max_days,
     return filings_df[cum_mask]
 
 
-""" Main document scraping functions """
-def download_company_filings(req_header, mrps, comp_dir, select_filings, cik, write_txt, write_pdf):
+def download_company_filings(req_header, mrps, comp_dir, select_filings, ticker, write_txt, write_pdf):
     """ 
     Downloads selcted documents for a company, organizing subdirectories.
     
@@ -206,7 +201,7 @@ def download_company_filings(req_header, mrps, comp_dir, select_filings, cik, wr
     for index, curr_doc in select_filings.iterrows():
         response = requests_get_wrp(
             doc_url(
-                cik,
+                ticker.get("cik_str", ""),
                 curr_doc["accessionNumber"].replace("-",""),
                 curr_doc["primaryDocument"]
             ),
@@ -217,9 +212,13 @@ def download_company_filings(req_header, mrps, comp_dir, select_filings, cik, wr
             logging.info(f'Unsuccessful request for document {curr_doc["accessionNumber"]}. Continuing with next document for {comp_dir}')
             continue
 
-        curr_dir_full_path = os.path.join(comp_dir, curr_doc["form"])
+        curr_form = curr_doc["form"].replace("/","-") # directory safety
+        curr_dir_full_path = os.path.join(comp_dir, f'{curr_form}')
         os.makedirs(curr_dir_full_path, exist_ok=True)
-        curr_form_full_path = os.path.join(curr_dir_full_path, curr_doc["accessionNumber"])
+        curr_form_full_path = os.path.join(
+            curr_dir_full_path, 
+            f'{ticker.get("title","")} {curr_form} {curr_doc["filingDate"]}'
+        )
 
         if write_txt:
             with open(f"{curr_form_full_path}.txt", 'w', encoding='utf-8') as file:
@@ -229,14 +228,10 @@ def download_company_filings(req_header, mrps, comp_dir, select_filings, cik, wr
             pdfkit.from_string(
                 response.text, 
                 f"{curr_form_full_path}.pdf", 
-                options={
-                    'no-images': '',  
-                    'disable-external-links': '',
-                    'disable-internal-links': ''  
-                }
+                options={'enable-local-file-access': ''}
             )
 
-""" company facts functions """
+
 def comp_facts_df(comp_facts, query_fact_substr, sufficient) -> List[Tuple[str, str, str, pd.DataFrame]]:
     """
     Encapsulates the retrieval of historical data for any given company fact, given raw dictionary retrieved from SEC
@@ -297,7 +292,9 @@ def comp_fact_avg_change(matches_tuple_list, min_days, max_days) -> float:
     return deltas_mean
 
 
-""" Main function in the module, performing some hard-coded filtering """
+
+
+""" MAIN FILTERING FUNCTION """
 def screen_select_companies(
     # general parameters:
         req_header, mrps, tickers_df, root_dir, 
