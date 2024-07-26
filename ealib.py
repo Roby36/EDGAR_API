@@ -12,6 +12,8 @@ from collections import Counter
 import random
 import yfinance as yf
 import numpy as np
+from typing import Callable
+from typing import Tuple
 
 """ UTILITY FUNCTIONS """
 
@@ -111,6 +113,12 @@ def get_tickers_df(headers) -> pd.DataFrame:
     tickers_df["cik_str"] = tickers_df["cik_str"].astype(str).str.zfill(10)
     return tickers_df
 
+def get_sic(tickers_df: pd.DataFrame, ticker: str, req_header, mrps) -> str:
+    found_ticker = find_ticker(tickers_df, ticker)
+    if found_ticker.empty:
+        return None  # or some default value or error handling
+    return get_response_dict(metadata_url(found_ticker.iloc[0]["cik_str"]), req_header, mrps=mrps).get("sic")
+
 """ Compunded measures/indicators """
 def ocf_average_daily_burn_rate(ocf_df, start_col = "start", end_col = "end", ocf_val_col = "val"):
     # Start by converting start, end columns to datetime
@@ -120,8 +128,8 @@ def ocf_average_daily_burn_rate(ocf_df, start_col = "start", end_col = "end", oc
     # AVG(oper. cash flow / time period)
     return (ocf_df[ocf_val_col] / (ocf_df[end_col] - ocf_df[start_col]).dt.days).mean()
 
-"""Search functions """
-def find_ticker(df, query_ticker) -> pd.DataFrame:
+"""Search functions/ getters """
+def find_ticker(df: pd.DataFrame, query_ticker: str) -> pd.DataFrame:
     return df[df["ticker"] == query_ticker]
 
 def find_title_substring(df, query_title_substring) -> pd.DataFrame:
@@ -212,13 +220,14 @@ def download_company_filings(req_header, mrps, comp_dir, select_filings, ticker,
             logging.info(f'Unsuccessful request for document {curr_doc["accessionNumber"]}. Continuing with next document for {comp_dir}')
             continue
 
-        curr_form = curr_doc["form"].replace("/","-") # directory safety
+        # Before joining paths with os, clean of all "/" symbols!
+        curr_form = curr_doc["form"].replace("/","-")
+        doc_name = f'{ticker.get("title","")} {curr_form} {curr_doc["filingDate"]}'.replace("/","-")
+
+        # Once source names clean, proceed with directory construction os-work
         curr_dir_full_path = os.path.join(comp_dir, f'{curr_form}')
         os.makedirs(curr_dir_full_path, exist_ok=True)
-        curr_form_full_path = os.path.join(
-            curr_dir_full_path, 
-            f'{ticker.get("title","")} {curr_form} {curr_doc["filingDate"]}'
-        )
+        curr_form_full_path = os.path.join(curr_dir_full_path, doc_name)
 
         if write_txt:
             with open(f"{curr_form_full_path}.txt", 'w', encoding='utf-8') as file:
@@ -469,3 +478,78 @@ def screen_select_companies(
     return (comp_out_df, missing_data_df)
 
 
+
+
+
+""" Table cleaning functions """
+
+def subcolumns(df: pd.DataFrame, col: pd.Series) -> List:
+    """
+    Returns a mask, where False means that a column in the dataframe is 
+    a "subcolumn" of col, meaning that it contains the same data but more NaN values
+    """
+    mask = []
+    for index, dcol in df.items():
+        is_equal = col.isna() | dcol.isna() | (col == dcol)
+        mask.append(~((is_equal == 1).all()) or col.isna().sum() >= dcol.isna().sum())
+    return mask
+
+def discard_subcolumns(df : pd.DataFrame) -> pd.DataFrame:
+    """ 
+    Applies the subcolumns function on each column of the dataframe and returns the resulting dataframe
+    """
+    cum_mask = [True for _ in range(len(df.columns))] # initialize uniformly to True
+    for index, col in df.items():
+        mask = subcolumns(df, col)
+        cum_mask = [cum_mask[i] and mask[i] for i in range(len(cum_mask))] # vectorized AND operation
+    return df.loc[:, cum_mask]
+
+def clean_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """ (1) Remove fully NaN rows and columns """
+    res = df.dropna(how='all').dropna(axis=1, how='all')
+
+    """ (2) Remove duplicate columns """
+    df_transposed = res.T
+    df_transposed = df_transposed[~df_transposed.duplicated()]
+    res = df_transposed.T
+
+    """ (3) TODO: Convert Excel-style numbering to interpretable numbers """
+    res = res.map(lambda x: x.replace('—', '0') if isinstance(x, str) else x)  # Replace dashes with zero (assumes dashes mean zero)
+    res = res.map(lambda x: pd.to_numeric(x.replace(',', '').replace('(', '-').replace(')', '') if isinstance(x, str) else x, errors="ignore")) # TODO: Handle errors explicitly (warning)
+
+    """ (4) IMPORTANT: Discard NaN subcolumns AT THE END! """
+    res = discard_subcolumns(res)
+
+    """ TODO: other preprocessing steps """
+    return res
+
+
+def clean_tabs(
+        dfs: List[pd.DataFrame], 
+        clean_func: Callable[[pd.DataFrame], pd.DataFrame], 
+        remove_small_tabs: bool = True
+    ) -> List[pd.DataFrame]:
+    """ 
+    Overall cleaning function, taking a list of datatables 
+    and retuning the fully refined list
+    """
+    res_dfs = []
+    for df in dfs:
+        """ First clean this df """
+        res_df = clean_func(df)
+
+        """ Then start applying various filters """
+        if remove_small_tabs and res_df.shape[0] <= 1 and res_df.shape[1] <= 2:
+            continue
+        
+        """ Finally save the dataframe to the list"""
+        res_dfs.append(res_df)
+    
+    return res_dfs
+
+
+def df_contains_substr(df: pd.DataFrame, query_str: str) -> bool:
+    return  df.map(lambda x: query_str.lower() in str(x).lower()).any().any()
+
+def df_contains_substr_all(df: pd.DataFrame, queries: List[str]) -> bool:
+    return all(df_contains_substr(df, query_str) for query_str in queries)
